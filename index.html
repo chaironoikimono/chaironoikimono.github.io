@@ -739,27 +739,49 @@ function ghHeaders(json){
   return h;
 }
 
+// find this account's existing weigh-in gist (or create one), so every device
+// converges on the SAME gist instead of each making its own.
+async function ensureGistId(){
+  let gid=getGistId();
+  if(gid) return gid;
+  let found=[];
+  try{
+    const list=await gh('/gists?per_page=100',{headers:ghHeaders(false)});
+    found=(list||[]).filter(g=>(g.files&&g.files[GFILE])||((g.description||'').indexOf('weigh-in tracker')>=0));
+  }catch(e){ if(e.status===401||e.status===403) throw e; }
+  if(found.length){
+    found.sort((a,b)=>new Date(b.updated_at)-new Date(a.updated_at));
+    gid=found[0].id;
+    // pull EVERY matching gist and merge into local, so a duplicate gist's data isn't orphaned
+    for(const f of found){
+      try{
+        const fg=await gh('/gists/'+f.id,{headers:ghHeaders(false)});
+        const c=fg.files&&fg.files[GFILE]&&fg.files[GFILE].content;
+        if(c) applyMerged(mergeData(JSON.parse(c), localPayload()));
+      }catch(e){}
+    }
+    localStorage.setItem(GID_KEY,gid);
+    return gid;
+  }
+  const created=await gh('/gists',{method:'POST',headers:ghHeaders(true),
+    body:JSON.stringify({description:'weigh-in tracker — synced data',public:false,files:{[GFILE]:{content:JSON.stringify(localPayload())}}})});
+  localStorage.setItem(GID_KEY, created.id);
+  return created.id;
+}
+
 async function syncNow(silent){
   if(!getToken()||syncing) return;
   syncing=true;
   if(!silent) setStatus('syncing…');
   try{
-    const mine=localPayload();
-    let gid=getGistId();
-    if(!gid){
-      const created=await gh('/gists',{method:'POST',headers:ghHeaders(true),
-        body:JSON.stringify({description:'weigh-in tracker — synced data',public:false,files:{[GFILE]:{content:JSON.stringify(mine)}}})});
-      localStorage.setItem(GID_KEY, created.id);
-      applyMerged(mine);
-    }else{
-      const g=await gh('/gists/'+gid,{headers:ghHeaders(false)});
-      let remote={entries:[],tombstones:{}};
-      try{const c=g.files&&g.files[GFILE]&&g.files[GFILE].content;if(c)remote=JSON.parse(c);}catch(e){}
-      const merged=mergeData(remote, mine);
-      await gh('/gists/'+gid,{method:'PATCH',headers:ghHeaders(true),
-        body:JSON.stringify({files:{[GFILE]:{content:JSON.stringify(merged)}}})});
-      applyMerged(merged);
-    }
+    const gid=await ensureGistId();
+    const g=await gh('/gists/'+gid,{headers:ghHeaders(false)});
+    let remote={entries:[],tombstones:{}};
+    try{const c=g.files&&g.files[GFILE]&&g.files[GFILE].content;if(c)remote=JSON.parse(c);}catch(e){}
+    const merged=mergeData(remote, localPayload());
+    await gh('/gists/'+gid,{method:'PATCH',headers:ghHeaders(true),
+      body:JSON.stringify({files:{[GFILE]:{content:JSON.stringify(merged)}}})});
+    applyMerged(merged);
     const now=Date.now();
     localStorage.setItem('mc_gist_last', String(now));
     setStatus('synced · '+fmtTime(now));
@@ -767,7 +789,7 @@ async function syncNow(silent){
   }catch(e){
     let m='sync failed — your data is safe on this device.';
     if(e.status===401) m='token rejected (401). check it has the gist scope and isn\'t expired.';
-    else if(e.status===404){m='gist not found (404). disconnect, then connect again to recreate it.';}
+    else if(e.status===404){m='gist not found (404). tap disconnect, then connect again.';}
     else if(e.status===403) m='github rate-limited or blocked (403). try again shortly.';
     setStatus(m);
   }finally{syncing=false;}
@@ -819,6 +841,19 @@ document.getElementById('btnSyncDisconnect').onclick=()=>{
 load();renderAll();
 refreshSyncUI();
 if(getToken()) syncNow(true);   // pull latest on open, merge in, then push (non-destructive)
+
+// keep an already-open tab fresh: re-pull when it regains focus (throttled)
+let lastAutoPull=Date.now();
+function maybeAutoPull(){
+  if(!getToken()||syncing)return;
+  const now=Date.now();
+  if(now-lastAutoPull<15000)return;
+  lastAutoPull=now;
+  syncNow(true);
+}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)maybeAutoPull();});
+window.addEventListener('focus',maybeAutoPull);
+
 window.addEventListener('resize',()=>renderChart());
 if('serviceWorker' in navigator){navigator.serviceWorker.register('sw.js').catch(()=>{});}
 </script>
