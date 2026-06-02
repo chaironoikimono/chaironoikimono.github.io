@@ -189,11 +189,12 @@
   <div id="log"></div>
 
   <div class="tools">
+    <button id="btnSync">☁ sync: off</button>
     <button id="btnImport">import old records</button>
     <button id="btnExportCsv">export csv</button>
     <button id="btnExportJson">backup (json)</button>
   </div>
-  <p class="note">data is saved on this device. open in Chrome → ⋮ → <b>Add to Home screen</b> to launch it like an app. back up the json now and then just in case.</p>
+  <p class="note">data is saved on this device. open in Chrome → ⋮ → <b>Add to Home screen</b> to launch it like an app. turn on <b>sync</b> to back up to your own private GitHub gist across devices.</p>
 </div>
 
 <button class="fab" id="fab">＋ log today</button>
@@ -243,6 +244,26 @@
   </div>
 </div>
 
+<!-- sync sheet -->
+<div class="sheet" id="syncSheet">
+  <div class="grab"></div>
+  <h3>sync &amp; backup</h3>
+  <p class="hint">stores your log as a <b>secret gist</b> in your own GitHub account, so every device shows the same data and you've got an off-device copy. paste a <b>classic</b> token with only the <code>gist</code> scope checked (it can't touch anything else in your account). the token is saved on this device only — never in the app's code.</p>
+  <div class="field">
+    <label>github token (classic · gist scope)</label>
+    <input type="password" id="fToken" placeholder="ghp_…" autocomplete="off" spellcheck="false">
+  </div>
+  <div id="syncStatus" class="hint" style="margin-top:-4px"></div>
+  <div class="sheet-actions">
+    <button class="btn ghost" id="btnSyncDisconnect" style="display:none">disconnect</button>
+    <button class="btn primary" id="btnSyncConnect">connect &amp; sync</button>
+  </div>
+  <div class="sheet-actions" id="syncNowRow" style="display:none;margin-top:8px">
+    <button class="btn primary" id="btnSyncNow" style="background:var(--sage)">sync now</button>
+  </div>
+  <p class="hint" style="margin-top:14px;opacity:.85">heads-up: a secret gist isn't listed or searchable, but it's reachable by anyone who has the exact gist URL — it's obscure, not encrypted. fine for a weight log; if you want it fully private later, I can switch the backend to a private repo instead.</p>
+</div>
+
 <div id="tip"></div>
 
 <script>
@@ -287,13 +308,21 @@ let range=90;
 let search='';
 
 /* ---------- storage ---------- */
+const TOMB_KEY='mc_weigh_in_tomb_v2';
+let tombstones={}; // {date: deletedAt_ms}
+
 function load(){
   try{const raw=localStorage.getItem(KEY);state=raw?JSON.parse(raw):SEED.map(clone);}
   catch(e){state=SEED.map(clone);}
   if(!Array.isArray(state)||!state.length) state=SEED.map(clone);
-  state.forEach(e=>{if(!e.id)e.id=uid();});
+  // deterministic baseline timestamp so identical seed data never spuriously "conflicts" across devices
+  state.forEach(e=>{if(!e.id)e.id=uid(); if(e.updated==null)e.updated=parseDate(e.date).getTime();});
+  try{const t=localStorage.getItem(TOMB_KEY);tombstones=t?JSON.parse(t):{};}catch(e){tombstones={};}
 }
-function save(){try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){}}
+function save(){
+  try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){}
+  try{localStorage.setItem(TOMB_KEY,JSON.stringify(tombstones));}catch(e){}
+}
 function clone(o){return JSON.parse(JSON.stringify(o));}
 function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2,7);}
 
@@ -522,7 +551,7 @@ const scrim=document.getElementById('scrim');
 const sheet=document.getElementById('sheet');
 const importSheet=document.getElementById('importSheet');
 function openScrim(){scrim.classList.add('open');}
-function closeAll(){scrim.classList.remove('open');sheet.classList.remove('open');importSheet.classList.remove('open');}
+function closeAll(){scrim.classList.remove('open');sheet.classList.remove('open');importSheet.classList.remove('open');document.getElementById('syncSheet').classList.remove('open');}
 scrim.onclick=closeAll;
 
 function openSheet(id){
@@ -555,21 +584,26 @@ document.getElementById('btnSave').onclick=()=>{
   const weight=wRaw===''?null:parseFloat(wRaw);
   const remark=document.getElementById('fRemark').value.trim();
   const period=document.getElementById('fPeriod').checked;
+  const now=Date.now();
   if(id){
     const e=state.find(x=>x.id===id);
-    Object.assign(e,{date,weight,remark,period});
+    const oldDate=e.date;
+    Object.assign(e,{date,weight,remark,period,updated:now});
+    if(oldDate!==date) tombstones[oldDate]=now; // moved date -> tombstone the old slot
   }else{
-    // overwrite if same date exists
     const ex=state.find(x=>x.date===date);
-    if(ex)Object.assign(ex,{weight,remark,period});
-    else state.push({id:uid(),date,weight,remark,period});
+    if(ex)Object.assign(ex,{weight,remark,period,updated:now});
+    else state.push({id:uid(),date,weight,remark,period,updated:now});
   }
-  save();renderAll();closeAll();
+  delete tombstones[date]; // re-adding a date cancels any prior deletion
+  save();renderAll();closeAll();syncPush();
 };
 document.getElementById('btnDelete').onclick=()=>{
   const id=document.getElementById('editId').value;
+  const e=state.find(x=>x.id===id);
+  if(e) tombstones[e.date]=Date.now();
   state=state.filter(x=>x.id!==id);
-  save();renderAll();closeAll();
+  save();renderAll();closeAll();syncPush();
 };
 
 /* ---------- ranges ---------- */
@@ -590,13 +624,14 @@ document.getElementById('btnImportRun').onclick=()=>{
   const txt=document.getElementById('importText').value;
   const rows=parseImport(txt);
   if(!rows.length){alert('couldn\'t find any rows — check the format.');return;}
-  let added=0;
+  let added=0;const now=Date.now();
   rows.forEach(r=>{
     const ex=state.find(x=>x.date===r.date);
-    if(ex)Object.assign(ex,{weight:r.weight,remark:r.remark,period:r.period});
-    else{state.push({id:uid(),...r});added++;}
+    if(ex)Object.assign(ex,{weight:r.weight,remark:r.remark,period:r.period,updated:now});
+    else{state.push({id:uid(),...r,updated:now});added++;}
+    delete tombstones[r.date];
   });
-  save();renderAll();closeAll();
+  save();renderAll();closeAll();syncPush();
   document.getElementById('importText').value='';
   alert(`imported ${rows.length} rows (${added} new).`);
 };
@@ -658,8 +693,132 @@ document.getElementById('btnExportCsv').onclick=()=>{
 };
 document.getElementById('btnExportJson').onclick=()=>download('weigh-in-backup.json',JSON.stringify(state,null,2),'application/json');
 
+/* ---------- gist sync ----------
+   safety model: every operation is read -> merge -> write.
+   merge is a union by date (newest `updated` wins) with tombstones for
+   deletes, so a sync can never silently drop entries this device hasn't seen,
+   and a failed/empty remote never wipes local data. */
+const TOK_KEY='mc_gist_token', GID_KEY='mc_gist_id', GFILE='weigh-in.json';
+let syncing=false;
+
+function getToken(){return localStorage.getItem(TOK_KEY)||'';}
+function getGistId(){return localStorage.getItem(GID_KEY)||'';}
+function setStatus(msg){const el=document.getElementById('syncStatus');if(el)el.textContent=msg;}
+function fmtTime(ts){const d=new Date(ts);return d.toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});}
+
+function localPayload(){return {v:1, entries:clone(state), tombstones:clone(tombstones)};}
+
+function mergeData(a,b){
+  a=a||{};b=b||{};
+  const tomb=Object.assign({}, a.tombstones||{});
+  for(const k in (b.tombstones||{})) tomb[k]=Math.max(tomb[k]||0, b.tombstones[k]);
+  const byDate={};
+  for(const e of [...(a.entries||[]), ...(b.entries||[])]){
+    if(!e||!e.date)continue;
+    const u=e.updated||0, prev=byDate[e.date];
+    if(!prev || u>(prev.updated||0)) byDate[e.date]=e;
+  }
+  const entries=[];
+  for(const e of Object.values(byDate)){
+    const t=tomb[e.date]||0;
+    if(t && t>=(e.updated||0)) continue;     // killed by a newer-or-equal tombstone
+    if(t) delete tomb[e.date];               // live entry wins -> prune stale tombstone
+    entries.push(e);
+  }
+  return {v:1, entries, tombstones:tomb};
+}
+
+async function gh(path, opts){
+  const r=await fetch('https://api.github.com'+path, opts||{});
+  if(!r.ok){const t=await r.text().catch(()=>'');const err=new Error('HTTP '+r.status);err.status=r.status;err.body=t;throw err;}
+  return r.json();
+}
+function ghHeaders(json){
+  const h={'Authorization':'Bearer '+getToken(),'Accept':'application/vnd.github+json'};
+  if(json)h['Content-Type']='application/json';
+  return h;
+}
+
+async function syncNow(silent){
+  if(!getToken()||syncing) return;
+  syncing=true;
+  if(!silent) setStatus('syncing…');
+  try{
+    const mine=localPayload();
+    let gid=getGistId();
+    if(!gid){
+      const created=await gh('/gists',{method:'POST',headers:ghHeaders(true),
+        body:JSON.stringify({description:'weigh-in tracker — synced data',public:false,files:{[GFILE]:{content:JSON.stringify(mine)}}})});
+      localStorage.setItem(GID_KEY, created.id);
+      applyMerged(mine);
+    }else{
+      const g=await gh('/gists/'+gid,{headers:ghHeaders(false)});
+      let remote={entries:[],tombstones:{}};
+      try{const c=g.files&&g.files[GFILE]&&g.files[GFILE].content;if(c)remote=JSON.parse(c);}catch(e){}
+      const merged=mergeData(remote, mine);
+      await gh('/gists/'+gid,{method:'PATCH',headers:ghHeaders(true),
+        body:JSON.stringify({files:{[GFILE]:{content:JSON.stringify(merged)}}})});
+      applyMerged(merged);
+    }
+    const now=Date.now();
+    localStorage.setItem('mc_gist_last', String(now));
+    setStatus('synced · '+fmtTime(now));
+    refreshSyncUI();
+  }catch(e){
+    let m='sync failed — your data is safe on this device.';
+    if(e.status===401) m='token rejected (401). check it has the gist scope and isn\'t expired.';
+    else if(e.status===404){m='gist not found (404). disconnect, then connect again to recreate it.';}
+    else if(e.status===403) m='github rate-limited or blocked (403). try again shortly.';
+    setStatus(m);
+  }finally{syncing=false;}
+}
+
+function applyMerged(payload){
+  state=payload.entries||[];
+  tombstones=payload.tombstones||{};
+  state.forEach(e=>{if(!e.id)e.id=uid();if(e.updated==null)e.updated=parseDate(e.date).getTime();});
+  save();renderAll();
+}
+
+function syncPush(){ if(getToken()) syncNow(true); }
+
+function refreshSyncUI(){
+  const on=!!getToken();
+  const last=localStorage.getItem('mc_gist_last');
+  document.getElementById('btnSync').textContent = on ? '☁ synced' : '☁ sync: off';
+  document.getElementById('btnSyncConnect').textContent = on ? 're-sync' : 'connect & sync';
+  document.getElementById('btnSyncDisconnect').style.display = on ? 'block' : 'none';
+  document.getElementById('syncNowRow').style.display = on ? 'flex' : 'none';
+  if(on && !document.getElementById('syncStatus').textContent){
+    setStatus(last ? 'connected · last synced '+fmtTime(+last) : 'connected.');
+  }
+}
+
+document.getElementById('btnSync').onclick=()=>{
+  document.getElementById('fToken').value=getToken();
+  setStatus('');refreshSyncUI();
+  openScrim();requestAnimationFrame(()=>document.getElementById('syncSheet').classList.add('open'));
+};
+document.getElementById('btnSyncConnect').onclick=async()=>{
+  const t=document.getElementById('fToken').value.trim();
+  if(!t){setStatus('paste a token first.');return;}
+  localStorage.setItem(TOK_KEY,t);
+  await syncNow(false);
+};
+document.getElementById('btnSyncNow').onclick=()=>syncNow(false);
+document.getElementById('btnSyncDisconnect').onclick=()=>{
+  if(!confirm('Disconnect sync on this device? Your data stays here; the gist is untouched.'))return;
+  localStorage.removeItem(TOK_KEY);
+  localStorage.removeItem(GID_KEY);
+  localStorage.removeItem('mc_gist_last');
+  setStatus('disconnected. data still saved locally.');
+  refreshSyncUI();
+};
+
 /* ---------- init ---------- */
 load();renderAll();
+refreshSyncUI();
+if(getToken()) syncNow(true);   // pull latest on open, merge in, then push (non-destructive)
 window.addEventListener('resize',()=>renderChart());
 if('serviceWorker' in navigator){navigator.serviceWorker.register('sw.js').catch(()=>{});}
 </script>
