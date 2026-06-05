@@ -48,9 +48,27 @@
   /* header */
   header{display:flex;align-items:center;gap:12px;padding:22px 0 14px}
   .mascot{flex:0 0 auto}
-  .title{line-height:1}
+  .title{line-height:1;flex:1}
   .title h1{font-family:var(--serif);font-weight:500;font-size:27px;margin:0;letter-spacing:-.01em}
   .title p{margin:3px 0 0;font-size:12.5px;color:var(--ink-faint);letter-spacing:.02em}
+  .eye{flex:0 0 auto;border:1px solid var(--line);background:var(--card);width:42px;height:42px;border-radius:13px;display:grid;place-items:center;cursor:pointer;font-size:19px;color:var(--ink-soft);box-shadow:var(--shadow)}
+  .eye:active{background:var(--paper-2)}
+  .eye.on{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+  /* privacy masking */
+  .masked{filter:blur(9px);user-select:none;pointer-events:none}
+  .dots{letter-spacing:.12em;color:var(--ink-faint)}
+  /* regime badges + management */
+  .tag.reg{color:#fff}
+  .reg-row{display:flex;gap:10px;align-items:flex-start;padding:11px 13px;border:1px solid var(--line);border-radius:13px;background:var(--card);margin-bottom:8px;box-shadow:var(--shadow)}
+  .reg-row .swatch{width:12px;height:12px;border-radius:50%;margin-top:5px;flex:0 0 auto}
+  .reg-row .rmid{flex:1;min-width:0}
+  .reg-row .rname{font-family:var(--serif);font-size:16px;font-weight:500}
+  .reg-row .rmeta{font-size:11.5px;color:var(--ink-soft);margin-top:2px}
+  .reg-row .ract{display:flex;gap:6px;flex:0 0 auto}
+  .swatches{display:flex;gap:8px;flex-wrap:wrap}
+  .swatches button{width:30px;height:30px;border-radius:50%;border:2px solid transparent;cursor:pointer}
+  .swatches button.sel{border-color:var(--ink)}
+  .addreg{width:100%;border:1px dashed var(--line);background:transparent;color:var(--ink-soft);border-radius:12px;padding:12px;font-family:var(--sans);font-size:14px;cursor:pointer;margin-bottom:6px}
 
   /* stat row */
   .stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:9px;margin-bottom:16px}
@@ -161,6 +179,7 @@
       <h1>weigh-in</h1>
       <p>a quiet log · trends over noise</p>
     </div>
+    <button class="eye" id="btnEye" title="hide numbers">👁</button>
   </header>
 
   <div class="stats" id="stats"></div>
@@ -190,6 +209,7 @@
 
   <div class="tools">
     <button id="btnSync">☁ sync: off</button>
+    <button id="btnRegimes">regimes</button>
     <button id="btnImport">import old records</button>
     <button id="btnExportCsv">export csv</button>
     <button id="btnExportJson">backup (json)</button>
@@ -264,6 +284,42 @@
   <p class="hint" style="margin-top:14px;opacity:.85">heads-up: a secret gist isn't listed or searchable, but it's reachable by anyone who has the exact gist URL — it's obscure, not encrypted. fine for a weight log; if you want it fully private later, I can switch the backend to a private repo instead.</p>
 </div>
 
+<!-- regimes sheet -->
+<div class="sheet" id="regimesSheet">
+  <div class="grab"></div>
+  <h3>regimes</h3>
+  <p class="hint">a regime counts days from its start, like cycle day — e.g. <i>reta d12</i>. it shows as a badge on every log on/after the start, and a dashed line on the chart. leave the end date blank while it's ongoing.</p>
+  <div id="regimesList"></div>
+  <button class="addreg" id="btnAddRegime">＋ new regime</button>
+</div>
+
+<!-- regime edit sheet -->
+<div class="sheet" id="regimeEditSheet">
+  <div class="grab"></div>
+  <h3 id="regimeEditTitle">new regime</h3>
+  <input type="hidden" id="rId">
+  <div class="field">
+    <label>name</label>
+    <input type="text" id="rName" placeholder="reta / pilates / TRT / aligner…" autocomplete="off">
+  </div>
+  <div class="field">
+    <label>start date</label>
+    <input type="date" id="rStart">
+  </div>
+  <div class="field">
+    <label>end date — leave blank if ongoing</label>
+    <input type="date" id="rEnd">
+  </div>
+  <div class="field">
+    <label>color</label>
+    <div class="swatches" id="rSwatches"></div>
+  </div>
+  <div class="sheet-actions">
+    <button class="btn ghost" id="btnRegimeDelete" style="display:none">delete</button>
+    <button class="btn primary" id="btnRegimeSave">save</button>
+  </div>
+</div>
+
 <div id="tip"></div>
 
 <script>
@@ -309,7 +365,13 @@ let search='';
 
 /* ---------- storage ---------- */
 const TOMB_KEY='mc_weigh_in_tomb_v2';
-let tombstones={}; // {date: deletedAt_ms}
+const REG_KEY='mc_weigh_in_regimes_v2';
+const REGTOMB_KEY='mc_weigh_in_regtomb_v2';
+const PRIV_KEY='mc_weigh_in_priv_v2';
+let tombstones={};            // {date: deletedAt_ms}
+let regimes=[];               // [{id,name,start,end|null,color,updated}]
+let regimeTombstones={};      // {id: deletedAt_ms}
+let priv=false;               // privacy/hidden view (per-device, not synced)
 
 function load(){
   try{const raw=localStorage.getItem(KEY);state=raw?JSON.parse(raw):SEED.map(clone);}
@@ -318,10 +380,15 @@ function load(){
   // deterministic baseline timestamp so identical seed data never spuriously "conflicts" across devices
   state.forEach(e=>{if(!e.id)e.id=uid(); if(e.updated==null)e.updated=parseDate(e.date).getTime();});
   try{const t=localStorage.getItem(TOMB_KEY);tombstones=t?JSON.parse(t):{};}catch(e){tombstones={};}
+  try{const r=localStorage.getItem(REG_KEY);regimes=r?JSON.parse(r):[];}catch(e){regimes=[];}
+  try{const rt=localStorage.getItem(REGTOMB_KEY);regimeTombstones=rt?JSON.parse(rt):{};}catch(e){regimeTombstones={};}
+  priv=localStorage.getItem(PRIV_KEY)==='1';
 }
 function save(){
   try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){}
   try{localStorage.setItem(TOMB_KEY,JSON.stringify(tombstones));}catch(e){}
+  try{localStorage.setItem(REG_KEY,JSON.stringify(regimes));}catch(e){}
+  try{localStorage.setItem(REGTOMB_KEY,JSON.stringify(regimeTombstones));}catch(e){}
 }
 function clone(o){return JSON.parse(JSON.stringify(o));}
 function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2,7);}
@@ -352,6 +419,22 @@ function cycleInfo(sorted){
   return out;
 }
 
+/* ---------- regime logic ---------- */
+// active regimes on a given date string -> [{name,color,day}]
+function activeRegimesFor(dateStr){
+  const d=parseDate(dateStr).getTime();
+  const out=[];
+  for(const r of regimes){
+    if(!r.start)continue;
+    const s=parseDate(r.start).getTime();
+    if(d<s)continue;
+    if(r.end && d>parseDate(r.end).getTime())continue;
+    out.push({name:r.name, color:r.color||'#7d8a6a', day:Math.round((d-s)/DAY)+1, id:r.id});
+  }
+  return out;
+}
+function maskNum(){return '<span class="dots">•••</span>';}
+
 /* ---------- stats ---------- */
 function sortedAll(){return [...state].sort((a,b)=>parseDate(a.date)-parseDate(b.date));}
 
@@ -368,8 +451,8 @@ function renderStats(){
   const slope=weeklySlope(visibleWeighted());
   const trendTxt = slope==null ? '—' : (slope>0?'+':'') + slope.toFixed(2) + ' kg/wk';
   el.innerHTML=`
-    <div class="stat"><div class="lab">latest</div><div class="val">${trim(latest.weight)}</div><div class="sub">${MON[parseDate(latest.date).getMonth()]} ${parseDate(latest.date).getDate()}</div></div>
-    <div class="stat"><div class="lab">7-day avg</div><div class="val">${avg7.toFixed(1)}</div><div class="sub">${recent.length} reading${recent.length>1?'s':''}</div></div>
+    <div class="stat"><div class="lab">latest</div><div class="val">${priv?maskNum():trim(latest.weight)}</div><div class="sub">${MON[parseDate(latest.date).getMonth()]} ${parseDate(latest.date).getDate()}</div></div>
+    <div class="stat"><div class="lab">7-day avg</div><div class="val">${priv?maskNum():avg7.toFixed(1)}</div><div class="sub">${recent.length} reading${recent.length>1?'s':''}</div></div>
     <div class="stat"><div class="lab">trend</div><div class="val" style="font-size:20px">${trendTxt}</div><div class="sub">${range?'last '+range+'d':'all time'}</div></div>`;
 }
 function trim(n){return (Math.round(n*100)/100).toString();}
@@ -440,7 +523,7 @@ function renderChart(){
     const w=wMin+(wSpan*i/3);
     const y=Y(w);
     g+=`<line x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}" stroke="#e7dcc9" stroke-width="1"/>`;
-    g+=`<text x="${padL-5}" y="${y+3.5}" text-anchor="end" fill="#b3a695" font-family="Hanken Grotesk" font-size="9">${(Math.round(w*10)/10).toFixed(1)}</text>`;
+    if(!priv) g+=`<text x="${padL-5}" y="${y+3.5}" text-anchor="end" fill="#b3a695" font-family="Hanken Grotesk" font-size="9">${(Math.round(w*10)/10).toFixed(1)}</text>`;
   }
   // x labels (start, mid, end)
   const xl=[tMin,tMin+tSpan/2,tMax];
@@ -470,6 +553,15 @@ function renderChart(){
     d+=` L ${sm[sm.length-1].x} ${sm[sm.length-1].y}`;
     g+=`<path d="${d}" fill="none" stroke="#8a5a3b" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>`;
   }
+
+  // regime start markers (vertical line at each regime start that falls in range)
+  regimes.forEach(r=>{
+    if(!r.start)return;
+    const st=parseDate(r.start).getTime();
+    if(st<tMin-DAY||st>tMax+DAY)return;
+    const x=X(Math.max(tMin,Math.min(tMax,st)));
+    g+=`<line x1="${x}" y1="${padT}" x2="${x}" y2="${H-padB}" stroke="${r.color||'#7d8a6a'}" stroke-width="1.4" stroke-dasharray="3 3" opacity=".55"/>`;
+  });
 
   // points + period markers, store hit areas
   vis.forEach(e=>{
@@ -532,10 +624,14 @@ function renderLog(){
     if(info.isStart) tags+=`<span class="tag start">cycle day 1</span>`;
     else if(e.period && info.cd!=null) tags+=`<span class="tag pd">period · cd ${info.cd}</span>`;
     else if(info.cd!=null) tags+=`<span class="tag cd">cd ${info.cd}</span>`;
-    const w=e.weight!=null?`<div class="w">${trim(e.weight)} <span style="font-size:12px;color:var(--ink-faint)">kg</span></div>`:`<div class="w na">NA</div>`;
+    activeRegimesFor(e.date).forEach(r=>{tags+=`<span class="tag reg" style="background:${r.color}">${esc(r.name)} d${r.day}</span>`;});
+    let w;
+    if(priv) w=`<div class="w"><span class="dots">•••</span></div>`;
+    else w=e.weight!=null?`<div class="w">${trim(e.weight)} <span style="font-size:12px;color:var(--ink-faint)">kg</span></div>`:`<div class="w na">NA</div>`;
+    const rem=(!priv && e.remark)?`<div class="rem">${esc(e.remark)}</div>`:'';
     return `<div class="row">
       <div class="date"><div class="d">${dt.getDate()}</div><div class="my">${MON[dt.getMonth()]} '${String(dt.getFullYear()).slice(2)}</div></div>
-      <div class="mid">${w}${e.remark?`<div class="rem">${esc(e.remark)}</div>`:''}${tags?`<div class="tags">${tags}</div>`:''}</div>
+      <div class="mid">${w}${rem}${tags?`<div class="tags">${tags}</div>`:''}</div>
       <div class="acts"><button class="iconbtn" data-edit="${e.id}">✎</button></div>
     </div>`;
   }).join('');
@@ -551,7 +647,7 @@ const scrim=document.getElementById('scrim');
 const sheet=document.getElementById('sheet');
 const importSheet=document.getElementById('importSheet');
 function openScrim(){scrim.classList.add('open');}
-function closeAll(){scrim.classList.remove('open');sheet.classList.remove('open');importSheet.classList.remove('open');document.getElementById('syncSheet').classList.remove('open');}
+function closeAll(){scrim.classList.remove('open');sheet.classList.remove('open');importSheet.classList.remove('open');document.getElementById('syncSheet').classList.remove('open');document.getElementById('regimesSheet').classList.remove('open');document.getElementById('regimeEditSheet').classList.remove('open');}
 scrim.onclick=closeAll;
 
 function openSheet(id){
@@ -706,9 +802,34 @@ function getGistId(){return localStorage.getItem(GID_KEY)||'';}
 function setStatus(msg){const el=document.getElementById('syncStatus');if(el)el.textContent=msg;}
 function fmtTime(ts){const d=new Date(ts);return d.toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});}
 
-function localPayload(){return {v:1, entries:clone(state), tombstones:clone(tombstones)};}
+function localPayload(){return {v:1, entries:clone(state), tombstones:clone(tombstones), regimes:clone(regimes), regimeTombstones:clone(regimeTombstones)};}
+
+function mergeKeyed(aArr,bArr,aTomb,bTomb,keyFn){
+  const tomb=Object.assign({}, aTomb||{});
+  for(const k in (bTomb||{})) tomb[k]=Math.max(tomb[k]||0, bTomb[k]);
+  const by={};
+  for(const it of [...(aArr||[]), ...(bArr||[])]){
+    if(!it)continue; const k=keyFn(it); if(k==null)continue;
+    if(!by[k] || (it.updated||0)>(by[k].updated||0)) by[k]=it;
+  }
+  const out=[];
+  for(const it of Object.values(by)){
+    const t=tomb[keyFn(it)]||0;
+    if(t && t>=(it.updated||0)) continue;
+    if(t) delete tomb[keyFn(it)];
+    out.push(it);
+  }
+  return {arr:out, tomb};
+}
 
 function mergeData(a,b){
+  a=a||{};b=b||{};
+  const e=mergeKeyed(a.entries,b.entries,a.tombstones,b.tombstones,x=>x.date);
+  const r=mergeKeyed(a.regimes,b.regimes,a.regimeTombstones,b.regimeTombstones,x=>x.id);
+  return {v:1, entries:e.arr, tombstones:e.tomb, regimes:r.arr, regimeTombstones:r.tomb};
+}
+
+function _oldMergeData_unused(a,b){
   a=a||{};b=b||{};
   const tomb=Object.assign({}, a.tombstones||{});
   for(const k in (b.tombstones||{})) tomb[k]=Math.max(tomb[k]||0, b.tombstones[k]);
@@ -798,6 +919,8 @@ async function syncNow(silent){
 function applyMerged(payload){
   state=payload.entries||[];
   tombstones=payload.tombstones||{};
+  regimes=payload.regimes||[];
+  regimeTombstones=payload.regimeTombstones||{};
   state.forEach(e=>{if(!e.id)e.id=uid();if(e.updated==null)e.updated=parseDate(e.date).getTime();});
   save();renderAll();
 }
@@ -835,6 +958,86 @@ document.getElementById('btnSyncDisconnect').onclick=()=>{
   localStorage.removeItem('mc_gist_last');
   setStatus('disconnected. data still saved locally.');
   refreshSyncUI();
+};
+
+/* ---------- privacy toggle ---------- */
+function refreshEye(){const b=document.getElementById('btnEye');b.textContent=priv?'🙈':'👁';b.classList.toggle('on',priv);b.title=priv?'show numbers':'hide numbers';}
+document.getElementById('btnEye').onclick=()=>{priv=!priv;localStorage.setItem(PRIV_KEY,priv?'1':'0');refreshEye();renderAll();};
+
+/* ---------- regimes CRUD ---------- */
+const REG_PALETTE=['#7d8a6a','#8a5a3b','#5d7b8a','#9a6a86','#a8843f','#6a8a78','#9a5b5b','#5a5a8a'];
+let regimeColorPick=REG_PALETTE[0];
+
+document.getElementById('btnRegimes').onclick=()=>{renderRegimesList();openScrim();requestAnimationFrame(()=>document.getElementById('regimesSheet').classList.add('open'));};
+
+function renderRegimesList(){
+  const el=document.getElementById('regimesList');
+  const sorted=[...regimes].sort((a,b)=>parseDate(b.start)-parseDate(a.start));
+  if(!sorted.length){el.innerHTML='<div class="empty" style="padding:14px 0">no regimes yet.</div>';return;}
+  const today=todayISO();
+  el.innerHTML=sorted.map(r=>{
+    const act=activeRegimesFor(today).find(x=>x.id===r.id);
+    const meta = r.end ? `${r.start} → ${r.end} · ended` : (act?`started ${r.start} · day ${act.day}`:`starts ${r.start}`);
+    return `<div class="reg-row">
+      <div class="swatch" style="background:${r.color||'#7d8a6a'}"></div>
+      <div class="rmid"><div class="rname">${esc(r.name)}</div><div class="rmeta">${meta}</div></div>
+      <div class="ract"><button class="iconbtn" data-redit="${r.id}">✎</button></div>
+    </div>`;
+  }).join('');
+  el.querySelectorAll('[data-redit]').forEach(b=>b.onclick=()=>openRegimeEdit(b.dataset.redit));
+}
+
+function paintSwatches(){
+  const el=document.getElementById('rSwatches');
+  el.innerHTML=REG_PALETTE.map(c=>`<button data-c="${c}" style="background:${c}" class="${c===regimeColorPick?'sel':''}"></button>`).join('');
+  el.querySelectorAll('[data-c]').forEach(b=>b.onclick=()=>{regimeColorPick=b.dataset.c;paintSwatches();});
+}
+
+function openRegimeEdit(id){
+  const isEdit=!!id;
+  document.getElementById('regimeEditTitle').textContent=isEdit?'edit regime':'new regime';
+  document.getElementById('btnRegimeDelete').style.display=isEdit?'block':'none';
+  if(isEdit){
+    const r=regimes.find(x=>x.id===id);
+    document.getElementById('rId').value=id;
+    document.getElementById('rName').value=r.name;
+    document.getElementById('rStart').value=r.start;
+    document.getElementById('rEnd').value=r.end||'';
+    regimeColorPick=r.color||REG_PALETTE[0];
+  }else{
+    document.getElementById('rId').value='';
+    document.getElementById('rName').value='';
+    document.getElementById('rStart').value=todayISO();
+    document.getElementById('rEnd').value='';
+    regimeColorPick=REG_PALETTE[regimes.length%REG_PALETTE.length];
+  }
+  paintSwatches();
+  document.getElementById('regimesSheet').classList.remove('open');
+  openScrim();requestAnimationFrame(()=>document.getElementById('regimeEditSheet').classList.add('open'));
+}
+document.getElementById('btnAddRegime').onclick=()=>openRegimeEdit(null);
+
+document.getElementById('btnRegimeSave').onclick=()=>{
+  const id=document.getElementById('rId').value;
+  const name=document.getElementById('rName').value.trim();
+  const start=document.getElementById('rStart').value;
+  const end=document.getElementById('rEnd').value||null;
+  if(!name||!start){alert('name and start date required.');return;}
+  const now=Date.now();
+  if(id){
+    const r=regimes.find(x=>x.id===id);
+    Object.assign(r,{name,start,end,color:regimeColorPick,updated:now});
+  }else{
+    regimes.push({id:uid(),name,start,end,color:regimeColorPick,updated:now});
+  }
+  save();renderAll();closeAll();syncPush();
+};
+document.getElementById('btnRegimeDelete').onclick=()=>{
+  const id=document.getElementById('rId').value;
+  if(!confirm('Delete this regime? Your weigh-ins are untouched.'))return;
+  regimeTombstones[id]=Date.now();
+  regimes=regimes.filter(x=>x.id!==id);
+  save();renderAll();closeAll();syncPush();
 };
 
 /* ---------- init ---------- */
