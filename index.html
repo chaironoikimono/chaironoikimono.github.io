@@ -69,6 +69,14 @@
   .swatches button{width:30px;height:30px;border-radius:50%;border:2px solid transparent;cursor:pointer}
   .swatches button.sel{border-color:var(--ink)}
   .addreg{width:100%;border:1px dashed var(--line);background:transparent;color:var(--ink-soft);border-radius:12px;padding:12px;font-family:var(--sans);font-size:14px;cursor:pointer;margin-bottom:6px}
+  /* collapsible gantt */
+  .collapsible{padding:0;overflow:hidden}
+  .panel-toggle{width:100%;background:transparent;border:0;display:flex;align-items:center;justify-content:space-between;padding:15px 16px;cursor:pointer;font-family:var(--serif);font-size:16px;font-weight:500;color:var(--ink)}
+  .pt-count{color:var(--ink-faint);font-family:var(--sans);font-size:13px;font-weight:500}
+  .chev{transition:transform .22s;color:var(--ink-soft);font-size:15px}
+  .collapsible.open .chev{transform:rotate(180deg)}
+  .gantt-body{padding:0 14px 14px}
+  #gantt{width:100%;height:auto;display:block}
 
   /* stat row */
   .stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:9px;margin-bottom:16px}
@@ -199,6 +207,14 @@
       <span><i class="dot" style="background:#c9b79d"></i>daily weigh-in</span>
       <span><i class="dot" style="background:var(--rose)"></i>period day</span>
     </div>
+  </div>
+
+  <div class="panel collapsible" id="ganttPanel">
+    <button class="panel-toggle" id="ganttToggle">
+      <span>regimes <span class="pt-count" id="ganttCount"></span></span>
+      <span class="chev">⌄</span>
+    </button>
+    <div class="gantt-body" id="ganttBody" style="display:none"></div>
   </div>
 
   <div class="logbar">
@@ -382,7 +398,8 @@ function load(){
   try{const t=localStorage.getItem(TOMB_KEY);tombstones=t?JSON.parse(t):{};}catch(e){tombstones={};}
   try{const r=localStorage.getItem(REG_KEY);regimes=r?JSON.parse(r):[];}catch(e){regimes=[];}
   try{const rt=localStorage.getItem(REGTOMB_KEY);regimeTombstones=rt?JSON.parse(rt):{};}catch(e){regimeTombstones={};}
-  priv=localStorage.getItem(PRIV_KEY)==='1';
+  const _pv=localStorage.getItem(PRIV_KEY);
+  priv = (_pv===null) ? true : (_pv==='1');   // hidden by default on first load; remembers your toggle after
 }
 function save(){
   try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){}
@@ -533,6 +550,19 @@ function renderChart(){
     g+=`<text x="${X(t)}" y="${H-6}" text-anchor="${anchor}" fill="#b3a695" font-family="Hanken Grotesk" font-size="9">${lbl}</text>`;
   });
 
+  // regime span shading (drawn behind the data so it reads as an isolated window)
+  regimes.forEach(r=>{
+    if(!r.start)return;
+    const s=parseDate(r.start).getTime();
+    const e=r.end?parseDate(r.end).getTime():tMax;   // ongoing -> extend to right edge of view
+    if(e<tMin||s>tMax)return;                          // wholly outside the visible window
+    const x1=X(Math.max(s,tMin)), x2=X(Math.min(e,tMax));
+    const col=r.color||'#7d8a6a';
+    g+=`<rect x="${x1.toFixed(1)}" y="${padT}" width="${Math.max(1,x2-x1).toFixed(1)}" height="${(H-padT-padB).toFixed(1)}" fill="${col}" opacity="0.11"/>`;
+    if(s>=tMin&&s<=tMax) g+=`<line x1="${X(s).toFixed(1)}" y1="${padT}" x2="${X(s).toFixed(1)}" y2="${H-padB}" stroke="${col}" stroke-width="1.2" opacity="0.55"/>`;
+    if(!priv) g+=`<text x="${(Math.max(x1,padL)+3).toFixed(1)}" y="${padT+8}" fill="${col}" font-family="Hanken Grotesk" font-size="8" font-weight="600" opacity="0.9">${esc(r.name)}</text>`;
+  });
+
   // build weighted series with x coords
   const wser=weighted.map(e=>({x:X(parseDate(e.date).getTime()),y:Y(e.weight),w:e.weight}));
 
@@ -553,15 +583,6 @@ function renderChart(){
     d+=` L ${sm[sm.length-1].x} ${sm[sm.length-1].y}`;
     g+=`<path d="${d}" fill="none" stroke="#8a5a3b" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>`;
   }
-
-  // regime start markers (vertical line at each regime start that falls in range)
-  regimes.forEach(r=>{
-    if(!r.start)return;
-    const st=parseDate(r.start).getTime();
-    if(st<tMin-DAY||st>tMax+DAY)return;
-    const x=X(Math.max(tMin,Math.min(tMax,st)));
-    g+=`<line x1="${x}" y1="${padT}" x2="${x}" y2="${H-padB}" stroke="${r.color||'#7d8a6a'}" stroke-width="1.4" stroke-dasharray="3 3" opacity=".55"/>`;
-  });
 
   // points + period markers, store hit areas
   vis.forEach(e=>{
@@ -640,7 +661,47 @@ function renderLog(){
 function esc(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 
 /* ---------- render all ---------- */
-function renderAll(){renderStats();renderChart();renderLog();}
+let ganttOpen=false;
+function renderGantt(){
+  const panel=document.getElementById('ganttPanel');
+  const body=document.getElementById('ganttBody');
+  document.getElementById('ganttCount').textContent = regimes.length?`(${regimes.length})`:'';
+  panel.classList.toggle('open', ganttOpen);
+  if(!ganttOpen){body.style.display='none';return;}
+  body.style.display='block';
+  if(!regimes.length){body.innerHTML='<div class="empty" style="padding:16px 0">no regimes yet — add one with the “regimes” button below.</div>';return;}
+  const rows=[...regimes].sort((a,b)=>parseDate(a.start)-parseDate(b.start));
+  const today=parseDate(todayISO()).getTime();
+  let tMin=Math.min(...rows.map(r=>parseDate(r.start).getTime()));
+  let tMax=Math.max(today, ...rows.map(r=>r.end?parseDate(r.end).getTime():today));
+  let sp=Math.max(tMax-tMin, DAY); tMin-=sp*0.05; tMax+=sp*0.05; sp=tMax-tMin;
+  const W=360, padL=8, padR=8, rowH=34, top=12, axisH=18;
+  const H=top+rows.length*rowH+axisH;
+  const X=t=>padL+((t-tMin)/sp)*(W-padL-padR);
+  let g='';
+  const tx=X(today).toFixed(1);
+  g+=`<line x1="${tx}" y1="${top-6}" x2="${tx}" y2="${top+rows.length*rowH}" stroke="#c9b79d" stroke-width="1" stroke-dasharray="2 3"/>`;
+  rows.forEach((r,i)=>{
+    const y=top+i*rowH+rowH*0.62;
+    const sx=X(parseDate(r.start).getTime());
+    const end=r.end?parseDate(r.end).getTime():today;
+    const ex=X(end);
+    const col=r.color||'#7d8a6a';
+    const bh=13;
+    g+=`<rect x="${sx.toFixed(1)}" y="${(y-bh/2).toFixed(1)}" width="${Math.max(3,ex-sx).toFixed(1)}" height="${bh}" rx="6.5" fill="${col}" opacity="${r.end?0.5:0.92}"/>`;
+    if(!r.end) g+=`<circle cx="${ex.toFixed(1)}" cy="${y.toFixed(1)}" r="3.6" fill="${col}"/>`;
+    const dn=Math.round((end-parseDate(r.start).getTime())/DAY)+1;
+    const lbl=`${esc(r.name)} · d${dn}${r.end?' · ended':''}`;
+    g+=`<text x="${sx.toFixed(1)}" y="${(y-bh/2-4).toFixed(1)}" fill="#6f6256" font-family="Hanken Grotesk" font-size="10" font-weight="600">${lbl}</text>`;
+  });
+  [['start',padL,tMin],['middle',W/2,tMin+sp/2],['end',W-padR,tMax]].forEach(([anchor,xx,t])=>{
+    const d=new Date(t); const lab=`${MON[d.getMonth()]} ${d.getDate()}`;
+    g+=`<text x="${xx}" y="${H-4}" text-anchor="${anchor}" fill="#b3a695" font-family="Hanken Grotesk" font-size="9">${lab}</text>`;
+  });
+  body.innerHTML=`<svg id="gantt" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${g}</svg>`;
+}
+
+function renderAll(){renderStats();renderChart();renderGantt();renderLog();}
 
 /* ---------- entry sheet ---------- */
 const scrim=document.getElementById('scrim');
@@ -826,7 +887,8 @@ function mergeData(a,b){
   a=a||{};b=b||{};
   const e=mergeKeyed(a.entries,b.entries,a.tombstones,b.tombstones,x=>x.date);
   const r=mergeKeyed(a.regimes,b.regimes,a.regimeTombstones,b.regimeTombstones,x=>x.id);
-  return {v:1, entries:e.arr, tombstones:e.tomb, regimes:r.arr, regimeTombstones:r.tomb};
+  const base=Object.assign({}, a, b); // carry over any unknown future keys so an older build can't strip them
+  return Object.assign(base, {v:1, entries:e.arr, tombstones:e.tomb, regimes:r.arr, regimeTombstones:r.tomb});
 }
 
 function _oldMergeData_unused(a,b){
@@ -968,6 +1030,7 @@ document.getElementById('btnEye').onclick=()=>{priv=!priv;localStorage.setItem(P
 const REG_PALETTE=['#7d8a6a','#8a5a3b','#5d7b8a','#9a6a86','#a8843f','#6a8a78','#9a5b5b','#5a5a8a'];
 let regimeColorPick=REG_PALETTE[0];
 
+document.getElementById('ganttToggle').onclick=()=>{ganttOpen=!ganttOpen;renderGantt();};
 document.getElementById('btnRegimes').onclick=()=>{renderRegimesList();openScrim();requestAnimationFrame(()=>document.getElementById('regimesSheet').classList.add('open'));};
 
 function renderRegimesList(){
@@ -1058,7 +1121,11 @@ document.addEventListener('visibilitychange',()=>{if(!document.hidden)maybeAutoP
 window.addEventListener('focus',maybeAutoPull);
 
 window.addEventListener('resize',()=>renderChart());
-if('serviceWorker' in navigator){navigator.serviceWorker.register('sw.js').catch(()=>{});}
+if('serviceWorker' in navigator){
+  navigator.serviceWorker.register('sw.js').catch(()=>{});
+  let swReloaded=false;
+  navigator.serviceWorker.addEventListener('controllerchange',()=>{if(swReloaded)return;swReloaded=true;location.reload();});
+}
 </script>
 </body>
 </html>
